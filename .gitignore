@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+whisper_env/
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+.env.*
+*.env
+
+# Audio / media artifacts
+*.mp3
+*.wav
+*.m4a
+
+# Logs / temp files
+*.log
+*.tmp
+tmp/
+temp/
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# Misc
+.python-version
+*.sqlite
+.idea/
+.vscode/
+
