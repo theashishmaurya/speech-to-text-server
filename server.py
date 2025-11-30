@@ -1,7 +1,8 @@
 from fastapi import FastAPI, UploadFile, File ,HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from contextlib import asynccontextmanager
+from starlette.background import BackgroundTask
 import uvicorn
 import tempfile
 import os
@@ -11,6 +12,7 @@ import gc
 import asyncio
 import json
 import threading
+import re
 
 # GPU memory monitoring
 try:
@@ -57,6 +59,74 @@ def print_gpu_memory(label=""):
     if mem_info:
         print(f"💾 GPU Memory {label}: {mem_info['used_mb']:.1f}MB / {mem_info['total_mb']:.1f}MB ({mem_info['used_percent']:.1f}% used)")
     return mem_info
+
+def classify_error(error: Exception) -> tuple[int, str]:
+    """
+    Classify error and return appropriate HTTP status code and error message.
+    Returns: (status_code, error_message)
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__
+    
+    # Check for Out of Memory errors (OOM)
+    oom_patterns = [
+        r'out of memory',
+        r'oom',
+        r'cuda out of memory',
+        r'cudaerroroutofmemory',
+        r'insufficient memory',
+        r'memory allocation failed',
+        r'cannot allocate memory',
+        r'ran out of memory'
+    ]
+    
+    for pattern in oom_patterns:
+        if re.search(pattern, error_str, re.IGNORECASE):
+            return (500, f"Out of Memory Error: {str(error)}")
+    
+    # Check for CUDA/GPU related errors (server errors)
+    cuda_patterns = [
+        r'cuda',
+        r'gpu',
+        r'device',
+        r'cudnn',
+        r'nvidia'
+    ]
+    
+    for pattern in cuda_patterns:
+        if re.search(pattern, error_str, re.IGNORECASE):
+            return (500, f"GPU/CUDA Error: {str(error)}")
+    
+    # Check for file format/validation errors (client errors)
+    client_error_patterns = [
+        r'invalid file',
+        r'unsupported format',
+        r'file format',
+        r'cannot decode',
+        r'corrupted',
+        r'invalid audio',
+        r'file too large',
+        r'file size'
+    ]
+    
+    for pattern in client_error_patterns:
+        if re.search(pattern, error_str, re.IGNORECASE):
+            return (400, f"Invalid Request: {str(error)}")
+    
+    # Check for file not found errors
+    if 'file not found' in error_str or 'no such file' in error_str or 'filenotfound' in error_type.lower():
+        return (400, f"File Error: {str(error)}")
+    
+    # Check for permission errors
+    if 'permission' in error_str or 'permissiondenied' in error_type.lower():
+        return (403, f"Permission Error: {str(error)}")
+    
+    # Check for timeout errors
+    if 'timeout' in error_str or 'timed out' in error_str:
+        return (504, f"Request Timeout: {str(error)}")
+    
+    # Default: treat as server error (500)
+    return (500, f"Internal Server Error: {str(error)}")
 
 def cleanup_gpu_memory():
     """Clean up GPU memory by deleting models and clearing caches"""
@@ -236,22 +306,32 @@ async def gpu_info():
 
 async def transcribe_with_keepalive(tmp_path: str, audio_filename: str):
     """Generator that yields keep-alive messages during transcription"""
-    # Ensure model is loaded
+    # Ensure model is loaded - check before starting
     if model is None or batched_model is None:
-        yield json.dumps({"error": "Model is not loaded yet. Please wait for server startup to complete."}) + "\n"
         # Clean up temp file
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+        # Yield error instead of raising (since we're in a generator)
+        error_response = json.dumps({
+            "__error__": True,
+            "status_code": 503,
+            "detail": "Model is not loaded yet. Please wait for server startup to complete."
+        })
+        yield error_response
         return
     
     transcription_result = None
     transcription_error = None
+    transcription_error_status = None
     transcription_done = threading.Event()
     transcription_start_time = None
     
     def run_transcription():
         """Run transcription in a separate thread"""
-        nonlocal transcription_result, transcription_error, transcription_start_time
+        nonlocal transcription_result, transcription_error, transcription_error_status, transcription_start_time
         try:
             transcription_start_time = time.time()
             print(f"🎧 Transcribing: {audio_filename}")
@@ -267,8 +347,8 @@ async def transcribe_with_keepalive(tmp_path: str, audio_filename: str):
             try:
                 segments, info = batched_model.transcribe(
                     tmp_path, 
-                    batch_size=8,  # Reduced for 4GB GPU - increase if you have more VRAM
-                    # word_timestamps=True,
+                    batch_size=4,  # Reduced for 4GB GPU - increase if you have more VRAM
+                    word_timestamps=True,
                     # chunk_length=60,  # Process in 30-second chunks to avoid memory errors
                 )
                 segments = list(segments)  # The transcription will actually run here.
@@ -345,7 +425,11 @@ async def transcribe_with_keepalive(tmp_path: str, audio_filename: str):
             transcription_result = response
         except Exception as e:
             traceback.print_exc()
-            transcription_error = str(e)
+            # Classify error and get appropriate status code
+            status_code, error_message = classify_error(e)
+            transcription_error = error_message
+            transcription_error_status = status_code
+            print(f"❌ Transcription error [{status_code}]: {error_message}")
         finally:
             transcription_done.set()
     
@@ -383,14 +467,21 @@ async def transcribe_with_keepalive(tmp_path: str, audio_filename: str):
     except Exception as e:
         print(f"Warning: Could not delete temp file {tmp_path}: {e}")
     
-    # Send final clean result or error (no keep-alive pollution)
+    # Handle errors by yielding error info (will be handled by endpoint)
     if transcription_error:
-        error_response = json.dumps({"error": transcription_error})
+        # Yield error info with status code - endpoint will handle this
+        status_code = transcription_error_status if transcription_error_status else 500
+        error_response = json.dumps({
+            "__error__": True,
+            "status_code": status_code,
+            "detail": transcription_error
+        })
         yield error_response
-    else:
-        # Send final clean result - this is the only actual JSON in the response
-        final_response = json.dumps(transcription_result)
-        yield final_response
+        return
+    
+    # Send final clean result - this is the only actual JSON in the response
+    final_response = json.dumps(transcription_result)
+    yield final_response
 
 
 @app.post("/transcribe")
@@ -399,28 +490,156 @@ async def transcribe(audio: UploadFile = File(...)):
     if model is None or batched_model is None:
         raise HTTPException(status_code=503, detail="Model is not loaded yet. Please wait for server startup to complete.")
     
+    # Validate file
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
     # Save the uploaded file temporarily
-    suffix = os.path.splitext(audio.filename)[1] or ".mp3"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await audio.read())
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
-        # Use streaming response with keep-alive
-        # Keep-alive sends minimal whitespace; final response is clean JSON
-        return StreamingResponse(
+        suffix = os.path.splitext(audio.filename)[1] or ".mp3"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+
+        # Create a custom response that can handle errors with proper status codes
+        # We'll check the first chunk for errors and return appropriate response
+        class ErrorAwareStreamingResponse(Response):
+            def __init__(self, generator, tmp_file_path, *args, **kwargs):
+                self.generator = generator
+                self.tmp_file_path = tmp_file_path
+                self.error_checked = False
+                super().__init__(*args, **kwargs)
+            
+            async def __call__(self, scope, receive, send):
+                # Check first chunk for errors before streaming
+                gen = self.generator
+                first_chunk = None
+                
+                try:
+                    # Get first chunk
+                    try:
+                        first_chunk = await gen.__anext__()
+                    except StopAsyncIteration:
+                        # Generator ended immediately - error
+                        if self.tmp_file_path and os.path.exists(self.tmp_file_path):
+                            try:
+                                os.remove(self.tmp_file_path)
+                            except:
+                                pass
+                        await send({
+                            'type': 'http.response.start',
+                            'status': 500,
+                            'headers': [[b'content-type', b'application/json']],
+                        })
+                        await send({
+                            'type': 'http.response.body',
+                            'body': json.dumps({"error": "Transcription failed unexpectedly"}).encode(),
+                        })
+                        return
+                    
+                    # Check if first chunk is an error
+                    if first_chunk and first_chunk.strip().startswith('{'):
+                        try:
+                            first_data = json.loads(first_chunk.strip())
+                            if isinstance(first_data, dict) and first_data.get("__error__"):
+                                # Error detected - return proper status code
+                                error_status = first_data.get("status_code", 500)
+                                error_detail = first_data.get("detail", "Unknown error")
+                                # Clean up temp file
+                                if self.tmp_file_path and os.path.exists(self.tmp_file_path):
+                                    try:
+                                        os.remove(self.tmp_file_path)
+                                    except:
+                                        pass
+                                # Return JSONResponse with proper status
+                                await send({
+                                    'type': 'http.response.start',
+                                    'status': error_status,
+                                    'headers': [[b'content-type', b'application/json']],
+                                })
+                                await send({
+                                    'type': 'http.response.body',
+                                    'body': json.dumps({"error": error_detail}).encode(),
+                                })
+                                return
+                        except json.JSONDecodeError:
+                            pass  # Not JSON error, continue streaming
+                    
+                    # No error, start streaming response
+                    await send({
+                        'type': 'http.response.start',
+                        'status': 200,
+                        'headers': [[b'content-type', b'application/json']],
+                    })
+                    
+                    # Yield first chunk
+                    if first_chunk:
+                        await send({
+                            'type': 'http.response.body',
+                            'body': first_chunk.encode() if isinstance(first_chunk, str) else first_chunk,
+                            'more_body': True,
+                        })
+                    
+                    # Stream remaining chunks
+                    try:
+                        async for chunk in gen:
+                            await send({
+                                'type': 'http.response.body',
+                                'body': chunk.encode() if isinstance(chunk, str) else chunk,
+                                'more_body': True,
+                            })
+                    except StopAsyncIteration:
+                        pass
+                    
+                    # Final chunk
+                    await send({
+                        'type': 'http.response.body',
+                        'body': b'',
+                        'more_body': False,
+                    })
+                    
+                except Exception as e:
+                    traceback.print_exc()
+                    # Clean up temp file
+                    if self.tmp_file_path and os.path.exists(self.tmp_file_path):
+                        try:
+                            os.remove(self.tmp_file_path)
+                        except:
+                            pass
+                    # Classify error
+                    status_code, error_message = classify_error(e)
+                    # Send error response
+                    await send({
+                        'type': 'http.response.start',
+                        'status': status_code,
+                        'headers': [[b'content-type', b'application/json']],
+                    })
+                    await send({
+                        'type': 'http.response.body',
+                        'body': json.dumps({"error": error_message}).encode(),
+                    })
+        
+        # Use custom response that handles errors with proper status codes
+        return ErrorAwareStreamingResponse(
             transcribe_with_keepalive(tmp_path, audio.filename),
-            media_type="application/json"  # Final response is clean JSON
+            tmp_path
         )
+        
+    except HTTPException:
+        # Re-raise HTTPException (already has correct status code)
+        raise
     except Exception as e:
         traceback.print_exc()
         # Clean up temp file on error
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except:
                 pass
-        raise HTTPException(status_code=500, detail=str(e))
+        # Classify error and return appropriate status code
+        status_code, error_message = classify_error(e)
+        raise HTTPException(status_code=status_code, detail=error_message)
 
 
 if __name__ == "__main__":
